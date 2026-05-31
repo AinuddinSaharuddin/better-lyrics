@@ -298,11 +298,8 @@ export function createLyricsWrapper(): HTMLElement {
     const lines: string[] = [];
 
     for (const line of lineElements) {
-      const words = line.querySelectorAll(".blyrics--word");
-      const mainText = Array.from(words)
-        .map(w => w.textContent?.trim())
-        .filter(Boolean)
-        .join(" ");
+      const mainLine = Array.from(line.children).find(child => child.classList.contains("blyrics-line-main"));
+      const mainText = mainLine?.textContent?.replace(/\s+/g, " ").trim();
 
       const romanized = line.querySelector(`.${ROMANIZED_LYRICS_CLASS}`)?.textContent?.trim();
       const translated = line.querySelector(`.${TRANSLATED_LYRICS_CLASS}`)?.textContent?.trim();

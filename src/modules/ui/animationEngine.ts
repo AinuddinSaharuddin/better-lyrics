@@ -1,18 +1,15 @@
 import {
-  ANIMATING_CLASS,
   CURRENT_LYRICS_CLASS,
   LYRICS_CHECK_INTERVAL_ERROR,
   LYRICS_CLASS,
   NO_LYRICS_ELEMENT_LOG,
-  PAUSED_CLASS,
-  PRE_ANIMATING_CLASS,
   TAB_HEADER_CLASS,
   TAB_RENDERER_SELECTOR,
   USER_SCROLLING_CLASS,
 } from "@constants";
 import { AppState } from "@core/appState";
 import { t } from "@core/i18n";
-import { calculateLyricPositions, type LineData } from "@modules/lyrics/injectLyrics";
+import { calculateLyricPositions, type LineData, type PartData } from "@modules/lyrics/injectLyrics";
 import { registerThemeSetting } from "@modules/settings/themeOptions";
 import { hideAdOverlay, isAdPlaying, isLoaderActive, showAdOverlay } from "@modules/ui/dom";
 import { log } from "@utils";
@@ -22,12 +19,15 @@ const LYRIC_ENDING_THRESHOLD_S = registerThemeSetting("blyrics-lyric-ending-thre
 const EARLY_SCROLL_CONSIDER = registerThemeSetting("blyrics-early-scroll-consider-s", 0.62);
 const QUEUE_SCROLL_THRESHOLD = registerThemeSetting("blyrics-queue-scroll-ms", 150);
 const TIME_JUMP_THRESHOLD = 0.5;
+const SWIPE_LEAD_RATIO = registerThemeSetting("blyrics-swipe-lead-ratio", 0.1);
+const SWIPE_DURATION_RATIO = registerThemeSetting("blyrics-swipe-duration-ratio", 1.6);
 
 const ENABLE_DEBUG_RENDER = registerThemeSetting("blyrics-debug-renderer", false);
 
 let cachedTabRendererHeight: number | null = null;
 let tabRendererResizeObserver: ResizeObserver | null = null;
 let observedTabRenderer: HTMLElement | null = null;
+let scrollAnimation: Animation | null = null;
 
 // 0.5 means the selected lyric will be in the middle of the screen, 0 means top, 1 means bottom
 export const SCROLL_POS_OFFSET_RATIO = registerThemeSetting("blyrics-target-scroll-pos-ratio", 0.37);
@@ -94,6 +94,7 @@ export function resetActiveAnimations(): void {
   if (!AppState.lyricData || !animEngineState.lastPlayState) return;
   for (const line of AppState.lyricData.lines) {
     if (line.isSelected) {
+      resetLineAnimations(line);
       line.isAnimating = false;
     }
   }
@@ -104,6 +105,15 @@ export function resetActiveAnimations(): void {
  * Called when song is switched or cleaned up
  */
 export function resetAnimEngineState(): void {
+  scrollAnimation?.cancel();
+  scrollAnimation = null;
+  if (AppState.lyricData) {
+    for (const line of AppState.lyricData.lines) {
+      resetLineAnimations(line);
+      line.isAnimating = false;
+      line.isSelected = false;
+    }
+  }
   animEngineState.skipScrollsDecayTimes = [];
   animEngineState.lastActiveElements = [];
   animEngineState.lastScrollDebugContext.activeElms = [];
@@ -113,10 +123,588 @@ export function resetAnimEngineState(): void {
   animEngineState.passiveScrollAccumulatedTime = 0;
   animEngineState.passiveLastWallTime = 0;
   stopPassiveScrollLoop();
-  cachedDurations.clear();
+  clearAnimationStyleCache();
 }
 
-export let cachedDurations: Map<string, number> = new Map();
+function resetPartAnimations(part: PartData): void {
+  for (const animation of part.animations) {
+    animation.cancel();
+  }
+  part.animations = [];
+  part.animationStartTimeMs = Infinity;
+}
+
+function resetLineAnimations(lineData: LineData): void {
+  const children = [lineData, ...lineData.parts];
+  children.forEach(resetPartAnimations);
+}
+
+function setAnimationsPlayState(lineData: LineData, isPlaying: boolean): void {
+  const children = [lineData, ...lineData.parts];
+  for (const part of children) {
+    for (const animation of part.animations) {
+      if (isPlaying) {
+        animation.play();
+      } else {
+        animation.pause();
+      }
+    }
+  }
+}
+
+function animationCurrentTime(animation: Animation, currentTimeMs: number): void {
+  try {
+    animation.currentTime = Math.max(0, currentTimeMs);
+  } catch {
+    // Some browsers reject currentTime before the animation is ready. In that case
+    // the next tick will recreate the animation from the current playback time.
+  }
+}
+
+const LINE_SYNCED_WORD_CLASS = "blyrics-line-synced-word";
+const WORD_HIGHLIGHT_SELECTOR = ".blyrics-word-highlight";
+const INSTRUMENTAL_FILL_SELECTOR = ".blyrics--instrumental-fill";
+const INSTRUMENTAL_WAVE_CLIP_SELECTOR = ".blyrics--wave-clip";
+const INSTRUMENTAL_WAVE_PATH_SELECTOR = ".blyrics--wave-path";
+
+interface AnimationConfig {
+  enabled: {
+    lineScale: boolean;
+    wordWobble: boolean;
+    highlightSwipe: boolean;
+    highlightGlow: boolean;
+    highlightFade: boolean;
+    scroll: boolean;
+    instrumental: boolean;
+  };
+  line: {
+    durationMs: number;
+    enterEasing: string;
+    exitEasing: string;
+    enterFrom: string;
+    enterTo: string;
+    exitFrom: string;
+    exitTo: string;
+  };
+  highlight: {
+    fadeInDurationMs: number;
+    fadeOutDurationMs: number;
+    fadeInEasing: string;
+    fadeOutEasing: string;
+    swipeEasing: string;
+    swipeStartFrom: string;
+    swipeEndFrom: string;
+    swipeStartTo: string;
+    swipeEndTo: string;
+    glowFrom: string;
+    glowTo: string;
+    glowDurationRatio: number;
+    glowMinDurationMs: number;
+    glowEasing: string;
+  };
+  word: {
+    wobbleDurationMs: number;
+    wobbleEasing: string;
+    wobblePeakEasing: string;
+    wobbleEndEasing: string;
+    wobbleFrom: string;
+    wobblePeak: string;
+    wobbleSettle: string;
+    wobbleTo: string;
+    wobblePeakOffset: number;
+    wobbleSettleOffset: number;
+  };
+  instrumental: {
+    fillFadeDurationMs: number;
+    fillFadeEasing: string;
+    fillFrom: string;
+    fillTo: string;
+    fillEasing: string;
+    waveFrom: string;
+    waveTo: string;
+    waveEasing: string;
+  };
+  scroll: {
+    durationMs: number;
+    easing: string;
+  };
+}
+
+interface HighlightAnimations {
+  animations: Animation[];
+  swipe?: Animation;
+  fade?: Animation;
+  glow?: Animation;
+}
+
+function activeTextGradientKeyframes(config: AnimationConfig): Keyframe[] {
+  return [
+    {
+      "--lyric-transition-amount-start": config.highlight.swipeStartFrom,
+      "--lyric-transition-amount-end": config.highlight.swipeEndFrom,
+    },
+    {
+      "--lyric-transition-amount-start": config.highlight.swipeStartTo,
+      "--lyric-transition-amount-end": config.highlight.swipeEndTo,
+    },
+  ] as Keyframe[];
+}
+
+function activeTextGlowKeyframes(config: AnimationConfig): Keyframe[] {
+  return [{ filter: config.highlight.glowFrom }, { filter: config.highlight.glowTo }];
+}
+
+function activeTextOpacityKeyframes(): Keyframe[] {
+  return [{ opacity: 0 }, { opacity: 1 }];
+}
+
+function highlightTarget(part: PartData): { element: Element; options: KeyframeAnimationOptions } {
+  const highlight = part.lyricElement.querySelector(WORD_HIGHLIGHT_SELECTOR);
+  if (highlight) {
+    return { element: highlight, options: {} };
+  }
+  return { element: part.lyricElement, options: { pseudoElement: "::after" } as KeyframeAnimationOptions };
+}
+
+function lineSyncedTextKeyframes(config: AnimationConfig): Keyframe[] {
+  return [
+    {
+      opacity: 0,
+      "--lyric-transition-amount-start": config.highlight.swipeStartTo,
+      "--lyric-transition-amount-end": config.highlight.swipeEndTo,
+    },
+    {
+      opacity: 1,
+      "--lyric-transition-amount-start": config.highlight.swipeStartTo,
+      "--lyric-transition-amount-end": config.highlight.swipeEndTo,
+    },
+  ] as Keyframe[];
+}
+
+function fadeOutTextKeyframes(config: AnimationConfig): Keyframe[] {
+  return [
+    {
+      opacity: 1,
+      filter: config.highlight.glowTo,
+      "--lyric-transition-amount-start": config.highlight.swipeStartTo,
+      "--lyric-transition-amount-end": config.highlight.swipeEndTo,
+    },
+    {
+      opacity: 0,
+      filter: config.highlight.glowTo,
+      "--lyric-transition-amount-start": config.highlight.swipeStartTo,
+      "--lyric-transition-amount-end": config.highlight.swipeEndTo,
+    },
+  ] as Keyframe[];
+}
+
+function startRichSyncedHighlightAnimations(
+  part: PartData,
+  config: AnimationConfig,
+  swipeDelayMs: number,
+  wordDelayMs: number,
+  swipeDurationMs: number,
+  glowDurationMs: number
+): HighlightAnimations {
+  const animations: Animation[] = [];
+  const fadeInDuration = config.enabled.highlightFade ? config.highlight.fadeInDurationMs : 1;
+  const target = highlightTarget(part);
+
+  try {
+    let swipeAnimation: Animation | undefined;
+    if (config.enabled.highlightSwipe) {
+      swipeAnimation = target.element.animate(activeTextGradientKeyframes(config), {
+        delay: swipeDelayMs,
+        duration: swipeDurationMs,
+        easing: config.highlight.swipeEasing,
+        fill: "forwards",
+        ...target.options,
+      });
+      animations.push(swipeAnimation);
+    }
+
+    const opacityAnimation = target.element.animate(
+      config.enabled.highlightSwipe ? activeTextOpacityKeyframes() : lineSyncedTextKeyframes(config),
+      {
+        delay: wordDelayMs,
+        duration: fadeInDuration,
+        easing: config.enabled.highlightFade ? config.highlight.fadeInEasing : "linear",
+        fill: "forwards",
+        ...target.options,
+      }
+    );
+    animations.push(opacityAnimation);
+
+    let glowAnimation: Animation | undefined;
+    if (config.enabled.highlightGlow) {
+      glowAnimation = target.element.animate(activeTextGlowKeyframes(config), {
+        delay: wordDelayMs,
+        duration: glowDurationMs,
+        easing: config.highlight.glowEasing,
+        fill: "forwards",
+        ...target.options,
+      });
+      animations.push(glowAnimation);
+    }
+
+    return { animations, swipe: swipeAnimation, fade: opacityAnimation, glow: glowAnimation };
+  } catch {
+    const fallbackAnimation = part.lyricElement.animate(
+      [
+        { color: "var(--blyrics-lyric-inactive-color)" },
+        { color: "var(--blyrics-lyric-active-color)" },
+        { color: "var(--blyrics-lyric-active-color)" },
+      ],
+      {
+        delay: wordDelayMs,
+        duration: fadeInDuration,
+        easing: "linear",
+        fill: "forwards",
+      }
+    );
+    return { animations: [fallbackAnimation], fade: fallbackAnimation };
+  }
+}
+
+function startLineSyncedHighlightAnimations(
+  part: PartData,
+  config: AnimationConfig,
+  wordDelayMs: number,
+  glowDurationMs: number
+): HighlightAnimations {
+  const animations: Animation[] = [];
+  const fadeInDuration = config.enabled.highlightFade ? config.highlight.fadeInDurationMs : 1;
+  const target = highlightTarget(part);
+
+  try {
+    const opacityAnimation = target.element.animate(lineSyncedTextKeyframes(config), {
+      delay: wordDelayMs,
+      duration: fadeInDuration,
+      easing: config.enabled.highlightFade ? config.highlight.fadeInEasing : "linear",
+      fill: "forwards",
+      ...target.options,
+    });
+    animations.push(opacityAnimation);
+
+    let glowAnimation: Animation | undefined;
+    if (config.enabled.highlightGlow) {
+      glowAnimation = target.element.animate(activeTextGlowKeyframes(config), {
+        delay: wordDelayMs,
+        duration: glowDurationMs,
+        easing: config.highlight.glowEasing,
+        fill: "forwards",
+        ...target.options,
+      });
+      animations.push(glowAnimation);
+    }
+
+    return { animations, fade: opacityAnimation, glow: glowAnimation };
+  } catch {
+    const fallbackAnimation = part.lyricElement.animate(
+      [{ color: "var(--blyrics-lyric-inactive-color)" }, { color: "var(--blyrics-lyric-active-color)" }],
+      {
+        delay: wordDelayMs,
+        duration: fadeInDuration,
+        easing: config.enabled.highlightFade ? config.highlight.fadeInEasing : "linear",
+        fill: "forwards",
+      }
+    );
+    return { animations: [fallbackAnimation], fade: fallbackAnimation };
+  }
+}
+
+function startLineAnimation(lineData: LineData, config: AnimationConfig, currentTime: number, now: number): void {
+  resetPartAnimations(lineData);
+
+  const rawElapsedMs = (currentTime - lineData.time) * 1000;
+  const elapsedMs = Math.max(0, rawElapsedMs);
+  const delayMs = Math.max(0, -rawElapsedMs);
+
+  if (!config.enabled.lineScale) {
+    lineData.animations = [];
+    lineData.animationStartTimeMs = now + delayMs;
+    return;
+  }
+
+  const animation = lineData.lyricElement.animate(
+    [{ transform: config.line.enterFrom }, { transform: config.line.enterTo }],
+    {
+      delay: delayMs,
+      duration: config.line.durationMs,
+      easing: config.line.enterEasing,
+      fill: "forwards",
+    }
+  );
+
+  if (rawElapsedMs >= 0) {
+    animationCurrentTime(animation, Math.min(elapsedMs, config.line.durationMs));
+  }
+  lineData.animations = [animation];
+  lineData.animationStartTimeMs = now + delayMs;
+}
+
+function startLineExitAnimation(lineData: LineData, config: AnimationConfig): void {
+  resetPartAnimations(lineData);
+
+  if (!config.enabled.lineScale) {
+    return;
+  }
+
+  const animation = lineData.lyricElement.animate(
+    [{ transform: config.line.exitFrom }, { transform: config.line.exitTo }],
+    {
+      duration: config.line.durationMs,
+      easing: config.line.exitEasing,
+      fill: "none",
+    }
+  );
+
+  lineData.animations = [animation];
+  animation.addEventListener(
+    "finish",
+    () => {
+      resetPartAnimations(lineData);
+    },
+    { once: true }
+  );
+}
+
+function startWordAnimations(part: PartData, config: AnimationConfig, currentTime: number, now: number): void {
+  resetPartAnimations(part);
+
+  const rawElapsedMs = (currentTime - part.time) * 1000;
+  const timedDurationMs = part.duration * 1000;
+  const isLineSyncedWord = part.duration <= 0 || part.lyricElement.classList.contains(LINE_SYNCED_WORD_CLASS);
+  const swipeLeadMs = timedDurationMs * SWIPE_LEAD_RATIO.getNumberValue();
+  const swipeElapsedMs = rawElapsedMs + swipeLeadMs;
+  const swipeDelayMs = Math.max(0, -swipeElapsedMs);
+  const wordDelayMs = Math.max(0, -rawElapsedMs);
+  const elapsedMs = Math.max(0, rawElapsedMs);
+  const swipeDurationMs = timedDurationMs * SWIPE_DURATION_RATIO.getNumberValue();
+  const glowDurationMs = Math.max(
+    timedDurationMs * config.highlight.glowDurationRatio,
+    config.highlight.glowMinDurationMs
+  );
+  const fadeInDurationMs = config.enabled.highlightFade ? config.highlight.fadeInDurationMs : 1;
+
+  const highlightAnimations = isLineSyncedWord
+    ? startLineSyncedHighlightAnimations(part, config, wordDelayMs, config.highlight.glowMinDurationMs)
+    : startRichSyncedHighlightAnimations(part, config, swipeDelayMs, wordDelayMs, swipeDurationMs, glowDurationMs);
+
+  const wobbleAnimation = config.enabled.wordWobble
+    ? part.lyricElement.animate(
+        [
+          { transform: config.word.wobbleFrom },
+          {
+            transform: config.word.wobblePeak,
+            offset: config.word.wobblePeakOffset,
+            easing: config.word.wobblePeakEasing,
+          },
+          { transform: config.word.wobbleSettle, offset: config.word.wobbleSettleOffset },
+          { transform: config.word.wobbleTo, easing: config.word.wobbleEndEasing },
+        ],
+        {
+          delay: wordDelayMs,
+          duration: config.word.wobbleDurationMs,
+          easing: config.word.wobbleEasing,
+          fill: "forwards",
+        }
+      )
+    : null;
+
+  if (isLineSyncedWord) {
+    if (rawElapsedMs >= 0) {
+      if (highlightAnimations.fade) {
+        animationCurrentTime(highlightAnimations.fade, Math.min(elapsedMs, fadeInDurationMs));
+      }
+      if (highlightAnimations.glow) {
+        animationCurrentTime(highlightAnimations.glow, Math.min(elapsedMs, config.highlight.glowMinDurationMs));
+      }
+    }
+  } else {
+    if (swipeElapsedMs >= 0 && highlightAnimations.swipe) {
+      animationCurrentTime(highlightAnimations.swipe, Math.min(swipeElapsedMs, swipeDurationMs));
+    }
+    if (rawElapsedMs >= 0 && highlightAnimations.fade) {
+      animationCurrentTime(highlightAnimations.fade, Math.min(elapsedMs, fadeInDurationMs));
+    }
+    if (rawElapsedMs >= 0 && highlightAnimations.glow) {
+      animationCurrentTime(highlightAnimations.glow, Math.min(elapsedMs, glowDurationMs));
+    }
+  }
+  if (rawElapsedMs >= 0 && wobbleAnimation) {
+    animationCurrentTime(wobbleAnimation, Math.min(elapsedMs, config.word.wobbleDurationMs));
+  }
+  part.animations = wobbleAnimation
+    ? [...highlightAnimations.animations, wobbleAnimation]
+    : highlightAnimations.animations;
+  part.animationStartTimeMs =
+    now + (isLineSyncedWord || !highlightAnimations.swipe ? wordDelayMs : Math.min(swipeDelayMs, wordDelayMs));
+}
+
+function startLineAnimations(lineData: LineData, config: AnimationConfig, currentTime: number, now: number): void {
+  startLineAnimation(lineData, config, currentTime, now);
+  if (lineData.lyricElement.dataset.instrumental === "true") {
+    startInstrumentalAnimations(lineData, config, currentTime, now);
+    return;
+  }
+
+  for (const part of lineData.parts) {
+    startWordAnimations(part, config, currentTime, now);
+  }
+}
+
+function startWordExitAnimation(part: PartData, config: AnimationConfig): void {
+  resetPartAnimations(part);
+
+  const fadeDuration = config.enabled.highlightFade ? config.highlight.fadeOutDurationMs : 1;
+  const target = highlightTarget(part);
+  const animation = target.element.animate(fadeOutTextKeyframes(config), {
+    duration: fadeDuration,
+    easing: config.enabled.highlightFade ? config.highlight.fadeOutEasing : "linear",
+    fill: "none",
+    ...target.options,
+  });
+
+  part.animations = [animation];
+  animation.addEventListener(
+    "finish",
+    () => {
+      resetPartAnimations(part);
+    },
+    { once: true }
+  );
+}
+
+function startLineExitAnimations(lineData: LineData, config: AnimationConfig, currentTime: number): void {
+  startLineExitAnimation(lineData, config);
+
+  if (lineData.lyricElement.dataset.instrumental === "true") {
+    startInstrumentalExitAnimations(lineData, config, currentTime);
+    return;
+  }
+
+  for (const part of lineData.parts) {
+    if (currentTime >= part.time) {
+      startWordExitAnimation(part, config);
+    } else {
+      resetPartAnimations(part);
+    }
+  }
+}
+
+function animateInstrumentalChild(
+  lineData: LineData,
+  selector: string,
+  keyframes: Keyframe[],
+  options: KeyframeAnimationOptions
+): Animation | null {
+  const element = lineData.lyricElement.querySelector(selector) as Element | null;
+  if (!element) return null;
+
+  const animation = element.animate(keyframes, options);
+  lineData.animations.push(animation);
+  return animation;
+}
+
+function startInstrumentalAnimations(
+  lineData: LineData,
+  config: AnimationConfig,
+  currentTime: number,
+  now: number
+): void {
+  const rawElapsedMs = (currentTime - lineData.time) * 1000;
+  const elapsedMs = Math.max(0, rawElapsedMs);
+  const delayMs = Math.max(0, -rawElapsedMs);
+  const durationMs = Math.max(lineData.duration * 1000, 1);
+  const fillFadeDuration = config.enabled.instrumental ? config.instrumental.fillFadeDurationMs : 1;
+
+  const fillAnimation = animateInstrumentalChild(
+    lineData,
+    INSTRUMENTAL_FILL_SELECTOR,
+    [{ opacity: 0 }, { opacity: 1 }],
+    {
+      delay: delayMs,
+      duration: fillFadeDuration,
+      easing: config.enabled.instrumental ? config.instrumental.fillFadeEasing : "linear",
+      fill: "forwards",
+    }
+  );
+
+  let fillTravelAnimation: Animation | null = null;
+  let waveAnimation: Animation | null = null;
+  if (config.enabled.instrumental) {
+    fillTravelAnimation = animateInstrumentalChild(
+      lineData,
+      INSTRUMENTAL_WAVE_CLIP_SELECTOR,
+      [{ transform: config.instrumental.fillFrom }, { transform: config.instrumental.fillTo }],
+      {
+        delay: delayMs,
+        duration: durationMs,
+        easing: config.instrumental.fillEasing,
+        fill: "both",
+      }
+    );
+
+    waveAnimation = animateInstrumentalChild(
+      lineData,
+      INSTRUMENTAL_WAVE_PATH_SELECTOR,
+      [{ transform: config.instrumental.waveFrom }, { transform: config.instrumental.waveTo }],
+      {
+        delay: delayMs,
+        duration: durationMs,
+        easing: config.instrumental.waveEasing,
+        fill: "both",
+      }
+    );
+  }
+
+  if (rawElapsedMs >= 0) {
+    if (fillAnimation) {
+      animationCurrentTime(fillAnimation, Math.min(elapsedMs, fillFadeDuration));
+    }
+    for (const animation of [fillTravelAnimation, waveAnimation]) {
+      if (animation) {
+        animationCurrentTime(animation, Math.min(elapsedMs, durationMs));
+      }
+    }
+  }
+
+  lineData.animationStartTimeMs = now + delayMs;
+}
+
+function startInstrumentalExitAnimations(lineData: LineData, config: AnimationConfig, currentTime: number): void {
+  if (currentTime < lineData.time) return;
+
+  const fadeDuration =
+    config.enabled.instrumental && config.enabled.highlightFade ? config.highlight.fadeOutDurationMs : 1;
+  animateInstrumentalChild(lineData, INSTRUMENTAL_FILL_SELECTOR, [{ opacity: 1 }, { opacity: 0 }], {
+    duration: fadeDuration,
+    easing: config.enabled.instrumental ? config.highlight.fadeOutEasing : "linear",
+    fill: "none",
+  });
+}
+
+let cachedDurations: Map<string, number> = new Map();
+const cachedCSSValues: Map<string, string> = new Map();
+
+export function clearAnimationStyleCache(): void {
+  cachedDurations.clear();
+  cachedCSSValues.clear();
+}
+
+if (typeof window !== "undefined" && window.matchMedia) {
+  window.matchMedia("(prefers-reduced-motion: reduce)").addEventListener("change", clearAnimationStyleCache);
+}
+
+function getCSSValue(lyricsElement: HTMLElement, property: string, fallback: string): string {
+  let value = cachedCSSValues.get(property);
+  if (value === undefined) {
+    value = window.getComputedStyle(lyricsElement).getPropertyValue(property).trim() || fallback;
+    cachedCSSValues.set(property, value);
+  }
+  return value;
+}
 
 /**
  * Gets and caches a css duration.
@@ -130,11 +718,149 @@ export let cachedDurations: Map<string, number> = new Map();
 function getCSSDurationInMs(lyricsElement: HTMLElement, property: string): number {
   let duration = cachedDurations.get(property);
   if (duration === undefined) {
-    duration = toMs(window.getComputedStyle(lyricsElement).getPropertyValue(property));
+    duration = toMs(getCSSValue(lyricsElement, property, "0ms"));
     cachedDurations.set(property, duration);
   }
 
   return duration;
+}
+
+function getCSSDurationWithFallback(lyricsElement: HTMLElement, property: string, fallback: string): number {
+  return Math.max(toMs(getCSSValue(lyricsElement, property, fallback)), 1);
+}
+
+function getCSSNumber(lyricsElement: HTMLElement, property: string, fallback: number): number {
+  const value = Number.parseFloat(getCSSValue(lyricsElement, property, `${fallback}`));
+  return Number.isFinite(value) ? value : fallback;
+}
+
+function getCSSBoolean(lyricsElement: HTMLElement, property: string, fallback: boolean): boolean {
+  const value = getCSSValue(lyricsElement, property, fallback ? "1" : "0").toLowerCase();
+  if (value === "false" || value === "off" || value === "none") return false;
+  const numericValue = Number.parseFloat(value);
+  if (Number.isFinite(numericValue)) return numericValue > 0;
+  return fallback;
+}
+
+function getCSSOffset(lyricsElement: HTMLElement, property: string, fallback: number): number {
+  return Math.max(0, Math.min(1, getCSSNumber(lyricsElement, property, fallback)));
+}
+
+function readAnimationConfig(lyricsElement: HTMLElement): AnimationConfig {
+  return {
+    enabled: {
+      lineScale: getCSSBoolean(lyricsElement, "--blyrics-animate-line-scale", true),
+      wordWobble: getCSSBoolean(lyricsElement, "--blyrics-animate-word-wobble", true),
+      highlightSwipe: getCSSBoolean(lyricsElement, "--blyrics-animate-highlight-swipe", true),
+      highlightGlow: getCSSBoolean(lyricsElement, "--blyrics-animate-highlight-glow", true),
+      highlightFade: getCSSBoolean(lyricsElement, "--blyrics-animate-highlight-fade", true),
+      scroll: getCSSBoolean(lyricsElement, "--blyrics-animate-scroll", true),
+      instrumental: getCSSBoolean(lyricsElement, "--blyrics-animate-instrumental", true),
+    },
+    line: {
+      durationMs: getCSSDurationWithFallback(lyricsElement, "--blyrics-scale-transition-duration", "0.166s"),
+      enterEasing: getCSSValue(lyricsElement, "--blyrics-line-enter-easing", "ease"),
+      exitEasing: getCSSValue(lyricsElement, "--blyrics-line-exit-easing", "ease"),
+      enterFrom: getCSSValue(lyricsElement, "--blyrics-line-enter-transform-from", "scale(var(--blyrics-scale))"),
+      enterTo: getCSSValue(lyricsElement, "--blyrics-line-enter-transform-to", "scale(var(--blyrics-active-scale))"),
+      exitFrom: getCSSValue(lyricsElement, "--blyrics-line-exit-transform-from", "scale(var(--blyrics-active-scale))"),
+      exitTo: getCSSValue(lyricsElement, "--blyrics-line-exit-transform-to", "scale(var(--blyrics-scale))"),
+    },
+    highlight: {
+      fadeInDurationMs: getCSSDurationWithFallback(
+        lyricsElement,
+        "--blyrics-lyric-highlight-fade-in-duration",
+        "0.33s"
+      ),
+      fadeOutDurationMs: getCSSDurationWithFallback(
+        lyricsElement,
+        "--blyrics-lyric-highlight-fade-out-duration",
+        "0.5s"
+      ),
+      fadeInEasing: getCSSValue(lyricsElement, "--blyrics-lyric-highlight-fade-in-easing", "ease"),
+      fadeOutEasing: getCSSValue(lyricsElement, "--blyrics-lyric-highlight-fade-out-easing", "ease"),
+      swipeEasing: getCSSValue(lyricsElement, "--blyrics-highlight-swipe-easing", "linear"),
+      swipeStartFrom: getCSSValue(lyricsElement, "--blyrics-highlight-swipe-start-from", "-0.2"),
+      swipeEndFrom: getCSSValue(lyricsElement, "--blyrics-highlight-swipe-end-from", "-0.1"),
+      swipeStartTo: getCSSValue(lyricsElement, "--blyrics-highlight-swipe-start-to", "1.4"),
+      swipeEndTo: getCSSValue(lyricsElement, "--blyrics-highlight-swipe-end-to", "1.5"),
+      glowFrom: getCSSValue(
+        lyricsElement,
+        "--blyrics-highlight-glow-filter-from",
+        "drop-shadow(0 0 0.8rem var(--blyrics-glow-color))"
+      ),
+      glowTo: getCSSValue(
+        lyricsElement,
+        "--blyrics-highlight-glow-filter-to",
+        "drop-shadow(0 0 0 var(--blyrics-glow-color))"
+      ),
+      glowDurationRatio: getCSSNumber(lyricsElement, "--blyrics-highlight-glow-duration-ratio", 1.2),
+      glowMinDurationMs: getCSSDurationWithFallback(lyricsElement, "--blyrics-highlight-glow-min-duration", "1.2s"),
+      glowEasing: getCSSValue(lyricsElement, "--blyrics-highlight-glow-easing", "ease"),
+    },
+    word: {
+      wobbleDurationMs: getCSSDurationWithFallback(lyricsElement, "--blyrics-wobble-duration", "1s"),
+      wobbleEasing: getCSSValue(lyricsElement, "--blyrics-word-wobble-easing", "ease"),
+      wobblePeakEasing: getCSSValue(lyricsElement, "--blyrics-word-wobble-peak-easing", "ease-in-out"),
+      wobbleEndEasing: getCSSValue(lyricsElement, "--blyrics-word-wobble-end-easing", "ease-out"),
+      wobbleFrom: getCSSValue(lyricsElement, "--blyrics-word-wobble-transform-from", "scaleX(1)"),
+      wobblePeak: getCSSValue(
+        lyricsElement,
+        "--blyrics-word-wobble-transform-peak",
+        "translateX(0.05em) scaleX(1.025)"
+      ),
+      wobbleSettle: getCSSValue(lyricsElement, "--blyrics-word-wobble-transform-settle", "translateX(0) scaleX(1)"),
+      wobbleTo: getCSSValue(lyricsElement, "--blyrics-word-wobble-transform-to", "scaleX(1)"),
+      wobblePeakOffset: getCSSOffset(lyricsElement, "--blyrics-word-wobble-peak-offset", 0.125),
+      wobbleSettleOffset: getCSSOffset(lyricsElement, "--blyrics-word-wobble-settle-offset", 0.75),
+    },
+    instrumental: {
+      fillFadeDurationMs: getCSSDurationWithFallback(
+        lyricsElement,
+        "--blyrics-instrumental-fill-fade-duration",
+        "150ms"
+      ),
+      fillFadeEasing: getCSSValue(lyricsElement, "--blyrics-instrumental-fill-fade-easing", "ease"),
+      fillFrom: getCSSValue(lyricsElement, "--blyrics-instrumental-fill-transform-from", "translateY(78%)"),
+      fillTo: getCSSValue(lyricsElement, "--blyrics-instrumental-fill-transform-to", "translateY(-4%)"),
+      fillEasing: getCSSValue(lyricsElement, "--blyrics-instrumental-fill-easing", "linear"),
+      waveFrom: getCSSValue(lyricsElement, "--blyrics-instrumental-wave-transform-from", "scaleY(1.2)"),
+      waveTo: getCSSValue(lyricsElement, "--blyrics-instrumental-wave-transform-to", "scaleY(0.0001)"),
+      waveEasing: getCSSValue(lyricsElement, "--blyrics-instrumental-wave-easing", "ease-in"),
+    },
+    scroll: {
+      durationMs: getCSSDurationWithFallback(lyricsElement, "--blyrics-lyric-scroll-duration", "750ms"),
+      easing: getCSSValue(lyricsElement, "--blyrics-lyric-scroll-timing-function", "cubic-bezier(0.86, 0, 0.07, 1)"),
+    },
+  };
+}
+
+function animateScrollOffset(
+  lyricsElement: HTMLElement,
+  fromScrollTop: number,
+  toScrollTop: number,
+  durationMs: number,
+  easing: string
+): void {
+  scrollAnimation?.cancel();
+
+  const offset = toScrollTop - fromScrollTop;
+  scrollAnimation = lyricsElement.animate(
+    [{ transform: `translateY(${offset}px)` }, { transform: "translateY(0px)" }],
+    {
+      duration: durationMs,
+      easing,
+      fill: "none",
+    }
+  );
+
+  scrollAnimation.addEventListener(
+    "finish",
+    () => {
+      scrollAnimation = null;
+    },
+    { once: true }
+  );
 }
 
 // -- Skip Scrolls Decay --------------------------
@@ -373,6 +1099,7 @@ export function animationEngine(currentTime: number, eventCreationTime: number, 
     }
 
     const lyricScrollTime = currentTime + getCSSDurationInMs(lyricsElement, "--blyrics-scroll-timing-offset") / 1000;
+    const animationConfig = readAnimationConfig(lyricsElement);
 
     // Read layout values before the loop writes class changes, to avoid forced reflow
     const tabRenderer = document.querySelector(TAB_RENDERER_SELECTOR) as HTMLElement | null;
@@ -438,6 +1165,7 @@ export function animationEngine(currentTime: number, eventCreationTime: number, 
         lineData.accumulatedOffsetMs = lineData.accumulatedOffsetMs / 1.08;
         lineData.accumulatedOffsetMs += animationTimingOffset * 1000 * 0.4;
         if (lineData.isAnimating && Math.abs(lineData.accumulatedOffsetMs) > 100 && isPlaying) {
+          resetLineAnimations(lineData);
           lineData.isAnimating = false;
           // console.warn("[BLyrics-diag] DRIFT RESET", {
           //   accumulatedOffsetMs: lineData.accumulatedOffsetMs.toFixed(1),
@@ -447,22 +1175,8 @@ export function animationEngine(currentTime: number, eventCreationTime: number, 
 
         if (isPlaying !== lineData.isAnimationPlayStatePlaying) {
           lineData.isAnimationPlayStatePlaying = isPlaying;
-          const children = [lineData, ...lineData.parts];
-          if (!isPlaying) {
-            children.forEach(part => {
-              if (part.animationStartTimeMs > now) {
-                part.lyricElement.classList.remove(ANIMATING_CLASS);
-                part.lyricElement.classList.remove(PRE_ANIMATING_CLASS);
-              } else {
-                part.lyricElement.classList.add(PAUSED_CLASS);
-              }
-            });
-          } else {
-            children.forEach(part => {
-              part.lyricElement.classList.remove(PAUSED_CLASS);
-            });
-            lineData.isAnimating = false; // reset the animation
-          }
+          setAnimationsPlayState(lineData, isPlaying);
+          if (isPlaying) lineData.isAnimating = false; // reset the animation against current media time
         }
 
         if (!lineData.isAnimating) {
@@ -471,66 +1185,28 @@ export function animationEngine(currentTime: number, eventCreationTime: number, 
         }
       } else {
         if (lineData.isSelected) {
-          const children = [lineData, ...lineData.parts];
-          children.forEach(part => {
-            part.lyricElement.style.setProperty("--blyrics-swipe-delay", "");
-            part.lyricElement.style.setProperty("--blyrics-anim-delay", "");
-            part.lyricElement.classList.remove(ANIMATING_CLASS);
-            part.lyricElement.classList.remove(PRE_ANIMATING_CLASS);
-            part.lyricElement.classList.remove(PAUSED_CLASS);
-            part.animationStartTimeMs = Infinity;
-          });
-
+          if (isPlaying || timeJumped) {
+            startLineExitAnimations(lineData, animationConfig, currentTime);
+            lineData.isAnimating = false;
+          } else {
+            setAnimationsPlayState(lineData, false);
+            lineData.isAnimationPlayStatePlaying = false;
+          }
           lineData.isSelected = false;
-          lineData.isAnimating = false;
         }
       }
       return true;
     });
 
-    // Batched animation to avoid multiple reflows and bring reflows from O(n) to O(1)
     if (linesToAnimate.length > 0) {
-      // Prepare: set delays and add pre animating class
       for (const lineData of linesToAnimate) {
-        // const isReset = lineData.animationStartTimeMs !== Infinity;
-        // console.warn("[BLyrics-diag] ANIM " + (isReset ? "RESET" : "START"), {
-        //   wordCount: lineData.parts.length,
-        // });
-        const children = [lineData, ...lineData.parts];
-        for (const part of children) {
-          const timeDelta = currentTime - part.time;
-          const swipeAnimationDelay = -timeDelta - part.duration * 0.1 + "s";
-          const everythingElseDelay = -timeDelta + "s";
-
-          part.lyricElement.classList.remove(ANIMATING_CLASS);
-          part.lyricElement.classList.remove(PAUSED_CLASS);
-          part.lyricElement.style.setProperty("--blyrics-swipe-delay", swipeAnimationDelay);
-          part.lyricElement.style.setProperty("--blyrics-anim-delay", everythingElseDelay);
-          part.lyricElement.classList.add(PRE_ANIMATING_CLASS);
-        }
-      }
-
-      // Single reflow to flush all pending class/style changes
-      reflow(linesToAnimate[0].lyricElement);
-
-      // Activate: add animating class and update state
-      for (const lineData of linesToAnimate) {
-        const children = [lineData, ...lineData.parts];
-        for (const part of children) {
-          const timeDelta = currentTime - part.time;
-          part.lyricElement.classList.add(ANIMATING_CLASS);
-          part.animationStartTimeMs = now - timeDelta * 1000;
-        }
+        startLineAnimations(lineData, animationConfig, currentTime, now);
         lineData.isAnimating = true;
         lineData.lastAnimSetupAt = now;
-        lineData.isAnimationPlayStatePlaying = true;
+        lineData.isAnimationPlayStatePlaying = isPlaying;
         lineData.accumulatedOffsetMs = 0;
+        if (!isPlaying) setAnimationsPlayState(lineData, false);
       }
-
-      // console.warn("[BLyrics-diag] BATCH ANIM", {
-      //   lines: linesToAnimate.length,
-      //   totalParts: linesToAnimate.reduce((s, l) => s + l.parts.length + 1, 0),
-      // });
     }
 
     if (animEngineState.scrollResumeTime < Date.now() || animEngineState.scrollPos === -1) {
@@ -684,22 +1360,18 @@ export function animationEngine(currentTime: number, eventCreationTime: number, 
           animEngineState.lastScrollDebugContext.activeElms = activeElems;
 
           if (smoothScroll && Math.abs(scrollTop - scrollPos) > 2) {
-            // console.warn("[BLyrics-diag] SCROLL REFLOW", {
-            //   delta: Math.abs(scrollTop - scrollPos).toFixed(0),
-            // });
-            lyricsElement.style.transitionTimingFunction = "";
-            lyricsElement.style.transitionProperty = "";
-            lyricsElement.style.transitionDuration = "";
-
-            let scrollTime = getCSSDurationInMs(lyricsElement, "transition-duration");
-
-            lyricsElement.style.transition = "none";
-            lyricsElement.style.transform = `translate(0px, ${-(scrollTop - scrollPos)}px)`;
-            reflow(lyricsElement);
-            lyricsElement.style.transition = "";
-            lyricsElement.style.transform = "translate(0px, 0px)";
-
-            animEngineState.nextScrollAllowedTime = scrollTime + Date.now() + 20;
+            if (animationConfig.enabled.scroll) {
+              const scrollTime = animationConfig.scroll.durationMs;
+              animateScrollOffset(lyricsElement, scrollTop, scrollPos, scrollTime, animationConfig.scroll.easing);
+              animEngineState.nextScrollAllowedTime = scrollTime + Date.now() + 20;
+            } else {
+              scrollAnimation?.cancel();
+              scrollAnimation = null;
+              animEngineState.nextScrollAllowedTime = Date.now();
+            }
+          } else {
+            scrollAnimation?.cancel();
+            scrollAnimation = null;
           }
 
           scrollTop = scrollPos;

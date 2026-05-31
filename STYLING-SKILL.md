@@ -34,12 +34,54 @@ Essential reference for creating custom themes. For deep dives, see [STYLING.md]
 
 ```css
 :root {
+  --blyrics-animate-line-scale: 1;
+  --blyrics-animate-word-wobble: 1;
+  --blyrics-animate-highlight-swipe: 1;
+  --blyrics-animate-highlight-glow: 1;
+  --blyrics-animate-highlight-fade: 1;
+  --blyrics-animate-scroll: 1;
+  --blyrics-animate-instrumental: 1;
   --blyrics-loader-transition-duration: 0.6s;
   --blyrics-loader-transition-easing: cubic-bezier(0.22, 1, 0.36, 1);
   --blyrics-scale-transition-duration: 0.166s;
+  --blyrics-line-enter-transform-from: scale(var(--blyrics-scale));
+  --blyrics-line-enter-transform-to: scale(var(--blyrics-active-scale));
+  --blyrics-line-exit-transform-from: scale(var(--blyrics-active-scale));
+  --blyrics-line-exit-transform-to: scale(var(--blyrics-scale));
+  --blyrics-line-enter-easing: ease;
+  --blyrics-line-exit-easing: ease;
   --blyrics-lyric-highlight-fade-in-duration: 0.33s;
   --blyrics-lyric-highlight-fade-out-duration: 0.5s;
+  --blyrics-lyric-highlight-fade-in-easing: ease;
+  --blyrics-lyric-highlight-fade-out-easing: ease;
+  --blyrics-highlight-swipe-easing: linear;
+  --blyrics-highlight-swipe-start-from: -0.2;
+  --blyrics-highlight-swipe-end-from: -0.1;
+  --blyrics-highlight-swipe-start-to: 1.4;
+  --blyrics-highlight-swipe-end-to: 1.5;
+  --blyrics-highlight-glow-filter-from: drop-shadow(0 0 0.8rem var(--blyrics-glow-color));
+  --blyrics-highlight-glow-filter-to: drop-shadow(0 0 0 var(--blyrics-glow-color));
+  --blyrics-highlight-glow-duration-ratio: 1.2;
+  --blyrics-highlight-glow-min-duration: 1.2s;
+  --blyrics-highlight-glow-easing: ease;
   --blyrics-wobble-duration: 1s;
+  --blyrics-word-wobble-transform-from: scaleX(1);
+  --blyrics-word-wobble-transform-peak: translateX(0.05em) scaleX(1.025);
+  --blyrics-word-wobble-transform-settle: translateX(0) scaleX(1);
+  --blyrics-word-wobble-transform-to: scaleX(1);
+  --blyrics-word-wobble-peak-offset: 0.125;
+  --blyrics-word-wobble-settle-offset: 0.75;
+  --blyrics-word-wobble-easing: ease;
+  --blyrics-word-wobble-peak-easing: ease-in-out;
+  --blyrics-word-wobble-end-easing: ease-out;
+  --blyrics-instrumental-fill-fade-duration: 150ms;
+  --blyrics-instrumental-fill-fade-easing: ease;
+  --blyrics-instrumental-fill-transform-from: translateY(78%);
+  --blyrics-instrumental-fill-transform-to: translateY(-4%);
+  --blyrics-instrumental-fill-easing: linear;
+  --blyrics-instrumental-wave-transform-from: scaleY(1.2);
+  --blyrics-instrumental-wave-transform-to: scaleY(0.0001);
+  --blyrics-instrumental-wave-easing: ease-in;
   --blyrics-timing-offset: 0.115s;
   --blyrics-richsync-timing-offset: 0.150s;
   --blyrics-scroll-timing-offset: 0.5s;
@@ -98,6 +140,8 @@ Comment-based parameters that control JS behavior. Place anywhere in your theme:
 blyrics-disable-richsync = true;
 blyrics-line-synced-animation-delay = 50;
 blyrics-target-scroll-pos-ratio = 0.37;
+blyrics-swipe-lead-ratio = 0.1;
+blyrics-swipe-duration-ratio = 1.6;
 */
 ```
 
@@ -110,6 +154,8 @@ blyrics-target-scroll-pos-ratio = 0.37;
 | `blyrics-queue-scroll-ms` | `150` | Max queued scroll delay (ms) |
 | `blyrics-debug-renderer` | `false` | Enable debug overlay |
 | `blyrics-target-scroll-pos-ratio` | `0.37` | Lyric position (0=top, 0.5=center, 1=bottom) |
+| `blyrics-swipe-lead-ratio` | `0.1` | Rich-sync swipe lead as a fraction of word duration |
+| `blyrics-swipe-duration-ratio` | `1.6` | Rich-sync swipe duration as a multiple of word duration |
 | `blyrics-long-word-threshold` | `1500` | Duration (ms) above which `data-long-word` is set |
 | `blyrics-hide-instrumental-only` | `false` | Treat "[Instrumental Only]" as no lyrics (enables fullscreen effect) |
 | `blyrics-passive-scroll-enabled` | `true` | Unsynced auto-scroll: enable/disable entirely (overrides user setting) |
@@ -127,28 +173,29 @@ Properties set by JS at runtime on individual elements:
 | Property | Set On | Description |
 |----------|--------|-------------|
 | `--blyrics-duration` | `.blyrics--word`, `.blyrics--instrumental` | Duration of current element (ms) |
-| `--blyrics-anim-delay` | `.blyrics--word`, `.blyrics--line` | Delay until animation starts |
-| `--blyrics-swipe-delay` | `.blyrics--word::after` | Swipe transition delay (anim-delay - 10% of duration) |
+| `--blyrics-padding-top` | `:root` | Calculated top spacer for scroll positioning |
+| `--blyrics-padding-bottom` | `:root` | Calculated bottom spacer for scroll positioning |
+
+Lyric timing is driven by `element.animate()`. Older per-word runtime variables such as `--blyrics-anim-delay` and `--blyrics-swipe-delay` are not part of the default lyric timing path.
 
 ## DOM Structure
 
 ```
 .blyrics-container [data-sync] [data-loader-visible] [data-no-lyrics]
 ├── .blyrics--line (div) [data-agent] [data-time] [data-duration] [data-line-number]
-│   ├── span
-│   │   └── .blyrics--word (span) [data-content] [data-time] [data-duration] [data-long-word]
-│   ├── .blyrics--break (span) - line break
-│   └── .blyrics-background-lyric (span) - background vocals
-├── .blyrics--line.blyrics--animating (active line)
-│   └── .blyrics--word.blyrics--animating (animating word)
-│       └── .blyrics--word.blyrics--paused (paused state)
+│   ├── .blyrics-line-main (div)
+│   │   └── .blyrics-word-group (span)
+│   │       └── .blyrics--word (span) [data-content] [data-time] [data-duration] [data-long-word]
+│   │           └── .blyrics-word-highlight (span, only for long wrapped words)
+│   ├── .blyrics-background-line (div, only when primary background vocals are present)
+│   │   └── .blyrics-word-group.blyrics-background-lyric
+│   ├── .blyrics--romanized.blyrics-content-line
+│   └── .blyrics--translated.blyrics-content-line
 ├── .blyrics--instrumental.blyrics--line [data-instrumental="true"]
 │   └── .blyrics--instrumental-icon (svg)
 │       ├── .blyrics--instrumental-bg (path)
 │       ├── .blyrics--instrumental-fill (path)
 │       └── .blyrics--wave-clip/.blyrics--wave-path
-├── .blyrics--translated (span)
-├── .blyrics--romanized (span)
 └── .blyrics-footer
 ```
 
@@ -164,7 +211,7 @@ Properties set by JS at runtime on individual elements:
 
 | Attribute | Description |
 |-----------|-------------|
-| `data-content` | Word text (used by `::after` for karaoke) |
+| `data-content` | Word text (used by generated highlight overlay when no real overlay is needed) |
 | `data-time` | Start time in seconds |
 | `data-duration` | Duration in seconds |
 | `data-long-word` | `"true"` or absent - present when duration exceeds threshold |
@@ -183,11 +230,13 @@ Properties set by JS at runtime on individual elements:
 |----------|---------|
 | `.blyrics-container` | Main lyrics wrapper |
 | `.blyrics--line` | Lyric line (div) |
+| `.blyrics-line-main` | Main lyric text row |
+| `.blyrics-background-line` | Primary background vocal row |
+| `.blyrics-word-group` | Unbreakable word/syllable group |
 | `.blyrics--word` | Word span |
-| `.blyrics--animating` | Currently active/animating (USE THIS for styling) |
-| `.blyrics--pre-animating` | About to animate |
-| `.blyrics--active` | Currently highlighted (use in `:has()` only) |
-| `.blyrics--paused` | Playback paused |
+| `.blyrics-word-highlight` | Real highlight overlay for long wrapped words |
+| `.blyrics-line-synced-word` | Zero-duration line-synced word; fades in without rich-sync swipe |
+| `.blyrics--active` | Currently selected for scrolling/current line state |
 | `.blyrics-user-scrolling` | User is scrolling manually |
 | `.blyrics-rtl` | RTL language support |
 | `.blyrics--translated` | Translation text |
@@ -201,10 +250,11 @@ Properties set by JS at runtime on individual elements:
 
 ## Animation System
 
-Karaoke effect uses `::after` with `background-clip: text`:
+Karaoke effect uses `::after` with `background-clip: text`; long wrapped words use `.blyrics-word-highlight` instead so the highlight can wrap at inserted `<wbr>` points:
 
 ```css
-.blyrics--word::after {
+.blyrics--word::after,
+.blyrics-word-highlight {
   content: attr(data-content);
   color: transparent;
   background-image: linear-gradient(90deg, var(--blyrics-lyric-active-color) ..., transparent ...);
@@ -212,12 +262,22 @@ Karaoke effect uses `::after` with `background-clip: text`:
 }
 ```
 
+Timing uses the Web Animations API:
+
+- Rich-sync swipe starts at `wordStart - blyrics-swipe-lead-ratio * wordDuration`
+- Rich-sync swipe duration is `blyrics-swipe-duration-ratio * wordDuration`
+- Line-synced `.blyrics-line-synced-word` skips swipe and fades in at word time
+- Glow lasts `max(wordDuration * --blyrics-highlight-glow-duration-ratio, --blyrics-highlight-glow-min-duration)`
+- Lyric line scale and scroll smoothing also use `element.animate()`
+- Visual keyframe values, effect enable flags, durations, and easing are CSS variables; JS still owns scheduling, pause/resume, seeking, and cancellation
+- `prefers-reduced-motion: reduce` disables decorative motion through CSS variable overrides
+
 ### Keyframes
 
 | Animation | Description |
 |-----------|-------------|
-| `blyrics-wobble` | Word bounce effect (scaleX 1 -> 1.025 -> 1) |
-| `blyrics-glow` | Drop-shadow fade (0.8rem -> 0) |
+| `blyrics-wobble` | Historical word bounce effect; default timing now uses WAAPI |
+| `blyrics-glow` | Historical drop-shadow fade; default timing now uses WAAPI |
 | `blyrics-spin` | Loader rotation |
 | `blyrics-shimmer` | Loading text shimmer |
 | `blyrics-wave` | Instrumental wave oscillation |
@@ -331,11 +391,15 @@ Override `--blyrics-fullscreen-bottom-dock-shift` to tune the lift.
 ### 1. Disable Default Animations
 
 ```css
-@keyframes blyrics-wobble { 0%, to { transform: none; } }
-@keyframes blyrics-glow { 0%, to { filter: none; } }
-.blyrics--word::after {
-  animation: none !important;
-  content: none !important;
+:root {
+  --blyrics-animate-line-scale: 0;
+  --blyrics-animate-word-wobble: 0;
+  --blyrics-animate-highlight-swipe: 0;
+  --blyrics-animate-highlight-glow: 0;
+  --blyrics-animate-scroll: 0;
+  --blyrics-animate-instrumental: 0;
+  --blyrics-scale: 1;
+  --blyrics-active-scale: 1;
 }
 ```
 
@@ -360,11 +424,11 @@ Override `--blyrics-fullscreen-bottom-dock-shift` to tune the lift.
   filter: blur(6px);
   transition: opacity 0.7s, filter 0.7s, transform 1.66s;
 }
-.blyrics-container > div.blyrics--animating:not(:empty):not(.blyrics--translated):not(.blyrics--romanized) {
+.blyrics-container > div.blyrics--active:not(:empty) {
   opacity: 1;
   filter: blur(0px);
 }
-.blyrics-user-scrolling > div:not(.blyrics--animating) {
+.blyrics-user-scrolling > div {
   opacity: 1 !important;
   filter: blur(0px) !important;
 }
@@ -455,7 +519,7 @@ ytmusic-player-page::before {
 ### 11. User Scroll State
 
 ```css
-.blyrics-user-scrolling > div:not(.blyrics--animating) {
+.blyrics-user-scrolling > div {
   opacity: 1 !important;
   filter: blur(0px) !important;
 }
@@ -497,23 +561,15 @@ Target sustained notes for special effects:
 /* Set threshold in knobs */
 /* blyrics-long-word-threshold = 1500; */
 
-.blyrics--word[data-long-word]::after {
+.blyrics--word[data-long-word]::after,
+.blyrics--word[data-long-word] > .blyrics-word-highlight {
   --blyrics-glow-color: color(display-p3 1 0.8 0.3 / 1);
-  animation-duration: calc(var(--blyrics-duration) * 2) !important;
 }
 ```
 
-### 15. Paused State Handling
+### 15. Pause Behavior
 
-```css
-.blyrics--word.blyrics--paused {
-  animation-play-state: paused;
-}
-.blyrics--word.blyrics--paused::after {
-  transition-duration: 100000000s; /* Freeze transition */
-  opacity: 0.5;
-}
-```
+Playback pause is handled by pausing the active Web Animations API animations in JavaScript. Themes should avoid CSS rules that infer paused state from word classes; the default renderer no longer applies `.blyrics--paused`.
 
 ## Best Practices
 
@@ -525,13 +581,13 @@ Target sustained notes for special effects:
 6. **Handle `data-sync="none"`** - smooth transition when sync loads
 7. **Exclude translation/romanization** - `:not(.blyrics--translated):not(.blyrics--romanized)`
 8. **Handle user scroll** - `.blyrics-user-scrolling`
-9. **Use `.blyrics--animating`** for styling, `.blyrics--active` in `:has()` only
+9. **Prefer structural selectors** such as `.blyrics-line-main`, `.blyrics-word-group`, and data attributes; use `.blyrics--active` only for current-line affordances
 
 ## Do NOT Modify
 
 - `--noto-sans-universal` - International font fallback chain
 - `--blyrics-gradient-stops` - Complex fullscreen gradient
-- `.blyrics--active` for styling - use `.blyrics--animating` instead (`.blyrics--active` only in `:has()` checks)
+- Core animation variables such as `--lyric-transition-amount-start` and `--lyric-transition-amount-end` unless you are replacing the karaoke highlight effect
 - Core DOM structure expectations
 - YouTube Music element selectors (unless intentional)
 
@@ -539,7 +595,7 @@ Target sustained notes for special effects:
 
 | File | Purpose |
 |------|---------|
-| [`blyrics.css`](https://github.com/better-lyrics/better-lyrics/blob/master/public/css/blyrics.css) | Core lyrics styling and animations |
+| [`lyrics.css`](https://github.com/better-lyrics/better-lyrics/blob/master/public/css/blyrics/lyrics.css) | Core lyrics styling and animations |
 | [`ytmusic.css`](https://github.com/better-lyrics/better-lyrics/blob/master/public/css/ytmusic.css) | YouTube Music layout modifications |
 | [`themesong.css`](https://github.com/better-lyrics/better-lyrics/blob/master/public/css/themesong.css) | ThemeSong extension compatibility |
 | [`disablestylizedanimations.css`](https://github.com/better-lyrics/better-lyrics/blob/master/public/css/disablestylizedanimations.css) | Disables animations when toggled |
